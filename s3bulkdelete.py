@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""This module deletes a batch of documents from s3"""
+"""
+This module bulk deletes of set of documents from s3 using multiple threads
+for performance.
+"""
 
 import time
 import argparse
@@ -112,18 +115,25 @@ def deleter(args, to_delete_queue, deleted_queue, cancellation_token):
         # if no item within a short time then loop again.  This ensures that our thread stays responsive to cancellation_token
         try:
             key = to_delete_queue.get(timeout=1)
+            # check for our sentinel value indicating we have reached the end of the queue
+            if key is None:
+                logger.info('Reached end of queue.  Finishing processing items.')
+                break
         except queue.Empty:
             continue
 
         keys_to_delete.append({'Key': key})
 
-        # Poll our deletion queue until it is empty or
-        # until we have accumulated enough keys in this
+        # remove item from queue
+        to_delete_queue.task_done()
+
+        # if we have accumulated enough keys in this
         # thread's delete list to justify a batch delete
-        if len(keys_to_delete) >= args.batchsize or to_delete_queue.empty():
+        if len(keys_to_delete) >= args.batchsize:
             _delete_batch(args, keys_to_delete, s3client, deleted_queue)
 
-        to_delete_queue.task_done()
+            # reset the key list
+            keys_to_delete = []
 
     # Delete any remaining batches of items
     if keys_to_delete:
@@ -153,18 +163,19 @@ def _delete_batch(args, keys_to_delete, s3client, deleted_queue):
             deleted_count = 0
             if 'Deleted' in response:
                 deleted_count = len(response['Deleted'])
-            
+
             errored_count = 0
             if 'Errors' in response:
                 errored_count = len(response['Errors'])
                 logger.warning(response['Errors'])
 
             logger.debug('Deleted: %i, Errored: %i', deleted_count, errored_count)
-            
+  
         except:
             logger.exception('Error deleting objects')
             return
 
+    # update the count of deleted keys
     with deleted_keys.get_lock():
         deleted_keys.value += len(keys_to_delete)
 
@@ -172,15 +183,13 @@ def _delete_batch(args, keys_to_delete, s3client, deleted_queue):
     for key in keys_to_delete:
         deleted_queue.put(key['Key'])
 
-    keys_to_delete = []
-
-    # Print some progress info
+    # log some progress info
     if random.randint(0, args.deleter_threads) == args.deleter_threads:
         logger.info('Deleted %i out of %i keys found thus far.',
                     deleted_keys.value, queued_keys.value)
 
 
-def key_loader(filepath, to_delete_queue):
+def key_loader(filepath, to_delete_queue, sentinel_count):
     """
     Worker function to iterate through object key file and append items to queue.
 
@@ -199,6 +208,11 @@ def key_loader(filepath, to_delete_queue):
             to_delete_queue.put(line.rstrip())
             with queued_keys.get_lock():
                 queued_keys.value += 1
+
+    # Add sentinel item to queue to indicate we are finished adding items
+    #  create 1 sentinel for every deleter thread
+    for _ in range(0, sentinel_count):
+        to_delete_queue.put(None)
 
     logger.info('Loaded %i keys', queued_keys.value)
     logger.debug('%s finished', threading.current_thread().name)
@@ -219,7 +233,6 @@ def processed_writer(dest_filename, deleted_queue, cancellation_token):
                 key = deleted_queue.get(timeout=1)
             except queue.Empty:
                 # if no item within 10s then loop again.  This ensures that our thread stays responsive to cancellation_token
-                logger.debug('No items in deleted_queue')
                 continue
 
             dest_file.write(key+'\n')
@@ -228,7 +241,7 @@ def processed_writer(dest_filename, deleted_queue, cancellation_token):
     logger.debug('%s finished', threading.current_thread().name)
 
 
-def progress_updater(key_count):
+def progress_updater(key_count, cancellation_token):
     """
     Worker function to update the progress bar.
 
@@ -238,10 +251,10 @@ def progress_updater(key_count):
     logger.debug('%s started', threading.current_thread().name)
     last_value = 0
     with tqdm.tqdm(total=key_count, unit='keys') as pbar:
-        while deleted_keys.value <= key_count:
+        while not cancellation_token.is_set():
             pbar.update(deleted_keys.value-last_value)
             last_value = deleted_keys.value
-            time.sleep(.1)
+            time.sleep(.25)
 
         pbar.close()
 
@@ -284,8 +297,6 @@ def main():
 
     key_count = key_file_len(args.filepath)
 
-    deleter_cancellation_token = threading.Event()
-    processed_cancellation_token = threading.Event()
     to_delete_queue = multiprocessing.JoinableQueue(maxsize=args.maxqueue)
     deleted_queue = multiprocessing.JoinableQueue(maxsize=args.maxqueue)
 
@@ -295,13 +306,15 @@ def main():
     deleted_keys = multiprocessing.Value('i', 0)
 
     # Start the progress_updater thread
+    progress_cancellation_token = threading.Event()
     progress_updater_thread = threading.Thread(target=progress_updater,
                                                name="progress_updater_thread",
-                                               args=(key_count,))
+                                               args=(key_count, progress_cancellation_token))
     progress_updater_thread.daemon = True
     progress_updater_thread.start()
 
     # Now start all of our delete threads
+    deleter_cancellation_token = threading.Event()
     deleter_threads = []
     for i in range(args.deleter_threads):
         t = threading.Thread(target=deleter,
@@ -314,11 +327,12 @@ def main():
     # Start List thread
     list_thread = threading.Thread(target=key_loader,
                                    name="lister_thread",
-                                   args=(args.filepath, to_delete_queue))
+                                   args=(args.filepath, to_delete_queue, args.deleter_threads))
     list_thread.daemon = True
     list_thread.start()
 
     # Start our output processed writer thread
+    processed_cancellation_token = threading.Event()
     processed_writer_thread = threading.Thread(target=processed_writer,
                                                name="processed_writer_thread",
                                                args=('processed.txt', deleted_queue, processed_cancellation_token))
@@ -332,10 +346,10 @@ def main():
         list_thread.join()
 
         # Ensure all keys have been processed out of the queue
-        to_delete_queue.join()
+        #to_delete_queue.join()
 
         # kill all deleter threads
-        deleter_cancellation_token.set()
+        #deleter_cancellation_token.set()
 
         # Wait for threads to finish
         for thread in deleter_threads:
@@ -344,11 +358,13 @@ def main():
         # Ensure we've finished writing all processed keys to our file
         deleted_queue.join()
 
+        # Kill the progress updater thread
+        progress_cancellation_token.set()
+        progress_updater_thread.join()
+
         # Kill the process worker thread
         processed_cancellation_token.set()
         processed_writer_thread.join()
-
-        progress_updater_thread.join()
 
         time.sleep(5)
 
@@ -360,6 +376,8 @@ def main():
         print('\nCtrl-c pressed ...\n')
         processed_cancellation_token.set()
         deleter_cancellation_token.set()
+        progress_cancellation_token.set()
+        time.sleep(1)
 
 
 if __name__ == '__main__':
