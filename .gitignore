@@ -103,3 +103,5 @@ ENV/
 log.txt
 processed.txt
 input.txt
+
+.vscode/
