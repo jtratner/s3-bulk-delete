@@ -254,7 +254,7 @@ def progress_updater(key_count, cancellation_token):
         while not cancellation_token.is_set():
             pbar.update(deleted_keys.value-last_value)
             last_value = deleted_keys.value
-            time.sleep(.25)
+            time.sleep(.1)
 
         pbar.close()
 
@@ -345,18 +345,15 @@ def main():
         # Ensure all keys have been listed into the queue
         list_thread.join()
 
-        # Ensure all keys have been processed out of the queue
-        #to_delete_queue.join()
-
-        # kill all deleter threads
-        #deleter_cancellation_token.set()
-
         # Wait for threads to finish
         for thread in deleter_threads:
             thread.join()
 
         # Ensure we've finished writing all processed keys to our file
         deleted_queue.join()
+
+        # Give the progress updater time to finish getting to 100%
+        time.sleep(1)
 
         # Kill the progress updater thread
         progress_cancellation_token.set()
@@ -377,7 +374,6 @@ def main():
         processed_cancellation_token.set()
         deleter_cancellation_token.set()
         progress_cancellation_token.set()
-        time.sleep(1)
 
 
 if __name__ == '__main__':
