@@ -1,22 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-This module bulk deletes of set of documents from s3 using multiple threads
-for performance.
+This module bulk deletes of set of documents from s3 
 """
-
-import time
+import itertools
 import argparse
 import logging
-import random
-import sys
-import multiprocessing
-import queue
-import threading
 import boto3
 import tqdm
+import sys
 
-__version__ = '0.1'
+__version__ = '1.0.0'
 _LOG_LEVEL_STRINGS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
+_s3client = boto3.client('s3')
+
 
 
 def _log_level_string_to_int(log_level_string):
@@ -57,14 +53,7 @@ def get_args():
     parser.add_argument('--batchsize',
                         help='# of keys to batch delete (default 1000)',
                         type=int, default=1000)
-    parser.add_argument('--maxqueue',
-                        help='Max size of deletion queue (default 10k)',
-                        type=int, default=10000)
-    parser.add_argument('--deleterthreads',
-                        help='Number of deleter threads (default 10)',
-                        dest='deleter_threads',
-                        type=int, default=10)
-
+    
     return parser.parse_args()
 
 
@@ -93,178 +82,15 @@ def logger_setup(log_level):
     logging.getLogger('botocore').setLevel(logging.WARNING)
 
 
-def deleter(args, to_delete_queue, deleted_queue, cancellation_token):
-    """
-    Worker function that takes keys from the to_delete_queue and constructs
-    batch requests to s3 to delete those keys.  All deleted keys are added to the
-    deleted_queue so they can be logged as processed.
-
-    Note: This function is intended to be the target of 1 or more Threads.
-    """
-    logger.debug('%s started', threading.current_thread().name)
-
-    # Set up per-thread boto objects
-    session = boto3.session.Session()
-    s3client = session.client('s3')
-
-    keys_to_delete = []
-
-    while not cancellation_token.is_set():
-        # Snatch a key off our deletion queue and add it
-        # to our local deletion list
-        # if no item within a short time then loop again.  This ensures that our thread stays responsive to cancellation_token
-        try:
-            key = to_delete_queue.get(timeout=1)
-            # check for our sentinel value indicating we have reached the end of the queue
-            if key is None:
-                logger.info('Reached end of queue.  Finishing processing items.')
-                break
-        except queue.Empty:
-            continue
-
-        keys_to_delete.append({'Key': key})
-
-        # remove item from queue
-        to_delete_queue.task_done()
-
-        # if we have accumulated enough keys in this
-        # thread's delete list to justify a batch delete
-        if len(keys_to_delete) >= args.batchsize:
-            _delete_batch(args, keys_to_delete, s3client, deleted_queue)
-
-            # reset the key list
-            keys_to_delete = []
-
-    # Delete any remaining batches of items
-    if keys_to_delete:
-        _delete_batch(args, keys_to_delete, s3client, deleted_queue)
-
-    logger.debug('%s finished', threading.current_thread().name)
-
-
-def _delete_batch(args, keys_to_delete, s3client, deleted_queue):
-    """Deletes a batch of keys from s3"""
-    if args.dryrun:
-        time.sleep(random.random())
-
-        if logger.isEnabledFor(logging.DEBUG):
-            for key in keys_to_delete:
-                logger.debug("Would have deleted '%s'", key)
-    else:
-        logger.debug('Deleting %s keys from s3', len(keys_to_delete))
-        try:
-            response = s3client.delete_objects(
-                Bucket=args.s3bucket,
-                Delete={
-                    'Objects': keys_to_delete
-                },
-            )
-
-            deleted_count = 0
-            if 'Deleted' in response:
-                deleted_count = len(response['Deleted'])
-
-            errored_count = 0
-            if 'Errors' in response:
-                errored_count = len(response['Errors'])
-                logger.warning(response['Errors'])
-
-            logger.debug('Deleted: %i, Errored: %i', deleted_count, errored_count)
-  
-        except:
-            logger.exception('Error deleting objects')
-            return
-
-    # update the count of deleted keys
-    with deleted_keys.get_lock():
-        deleted_keys.value += len(keys_to_delete)
-
-    # Track which keys have been successfully deleted
-    for key in keys_to_delete:
-        deleted_queue.put(key['Key'])
-
-    # log some progress info
-    if random.randint(0, args.deleter_threads) == args.deleter_threads:
-        logger.info('Deleted %i out of %i keys found thus far.',
-                    deleted_keys.value, queued_keys.value)
-
-
-def key_loader(filepath, to_delete_queue, sentinel_count):
-    """
-    Worker function to iterate through object key file and append items to queue.
-
-    Note: this is intended to be called from a Thread.
-    """
-
-    """
-    Note:
-    This should prevent us from loading the entire key set into memory at once as
-    there may millions of keys.
-    """
-
-    logger.debug('%s started', threading.current_thread().name)
-    with open(filepath, 'r') as object_key_file:
-        for line in object_key_file:
-            to_delete_queue.put(line.rstrip())
-            with queued_keys.get_lock():
-                queued_keys.value += 1
-
-    # Add sentinel item to queue to indicate we are finished adding items
-    #  create 1 sentinel for every deleter thread
-    for _ in range(0, sentinel_count):
-        to_delete_queue.put(None)
-
-    logger.info('Loaded %i keys', queued_keys.value)
-    logger.debug('%s finished', threading.current_thread().name)
-
-
-def processed_writer(dest_filename, deleted_queue, cancellation_token):
-    """
-    Worker function to write each processed key to an output file.
-
-    Note: this is intended to be called from a Thread.
-    """
-
-    logger.debug('%s started', threading.current_thread().name)
-
-    with open(dest_filename, 'w') as dest_file:
-        while not cancellation_token.is_set():
-            try:
-                key = deleted_queue.get(timeout=1)
-            except queue.Empty:
-                # if no item within 10s then loop again.  This ensures that our thread stays responsive to cancellation_token
-                continue
-
-            dest_file.write(key+'\n')
-            deleted_queue.task_done()
-
-    logger.debug('%s finished', threading.current_thread().name)
-
-
-def progress_updater(key_count, cancellation_token):
-    """
-    Worker function to update the progress bar.
-
-    Note: this is intended to be called from a Thread.
-    """
-
-    logger.debug('%s started', threading.current_thread().name)
-    last_value = 0
-    with tqdm.tqdm(total=key_count, unit='keys') as pbar:
-        while not cancellation_token.is_set():
-            pbar.update(deleted_keys.value-last_value)
-            last_value = deleted_keys.value
-            time.sleep(.1)
-
-        pbar.close()
-
-    logger.debug({'key_count': key_count,
-                  'deleted_keys': deleted_keys.value, 'last_value': last_value})
-    logger.debug('%s finished', threading.current_thread().name)
-
-
 def key_file_len(filepath):
-    """Quickly iterates the input file to get a count of keys to be processed."""
+    """Quickly iterates the input file to get a count of keys to be processed.
+    
+    Arguments:
+        filepath {str} -- path to the file to count
+    
+    Returns:
+        {int} -- number of lines in file
+    """
 
     with open(filepath) as key_file:
         i = None
@@ -272,11 +98,71 @@ def key_file_len(filepath):
             pass
     return i + 1
 
+# from itertools-recipes
+def grouper(iterable, chunksize, fillvalue=None):
+    """Collect data into fixed-length chunks or blocks
+    
+    Arguments:
+        iterable -- iterable to operate on
+        chunksize {int} -- size of groups to chunk into
+    
+    Keyword Arguments:
+        fillvalue -- value to pad the last group with to reach 'chunksize' (default: {None})
+    
+    Returns:
+        iterable of grouped values
 
-# Our main function
-def main():
-    """Our main function"""
+    Example:
+        grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx
+    """
+    args = [iter(iterable)] * n
+    return itertools.zip_longest(*args, fillvalue=fillvalue)
 
+
+def do_delete(input_filepath, s3bucket_name, batch_size=1000):
+    """
+    delete all objects with keys in input_filepath from 's3bucket_name' 
+    
+    Arguments:
+        input_filepath {str} -- filepath to the file containing line-delimited set of keys
+        s3bucket_name {str} -- name of s3 bucket to delete objects out of
+    
+    Keyword Arguments:
+        batch_size {int} -- batch size of delete requests against s3 (default: {1000})
+    """
+
+    # quickly find the total keys we expect to delete to setup the progress bar
+    total_keys = key_file_len(input_filepath)
+
+    with open(input_filepath, 'r') as object_key_file, open('deleted.txt', mode='w') as deleted_file, open('errored.txt', mode='w') as errors_file:
+        with tqdm.tqdm(total=total_keys,unit='keys',) as pbar:
+            for batch in grouper(object_key_file, batch_size):
+               
+                # start batch
+                delete_objects = []
+                for item in batch:
+                    if item is not None:
+                        delete_objects.append({'Key': item.rstrip()})
+
+                delete_response = _s3client.delete_objects(
+                    Bucket=s3bucket_name,
+                    Delete={
+                        'Objects': delete_objects
+                    },
+                )
+
+                pbar.update(batch_size)
+
+                if 'Deleted' in delete_response:
+                    for deleted in delete_response['Deleted']:
+                        deleted_file.write(deleted['Key']+'\n')
+                
+                if 'Errors' in delete_response:
+                    for error in delete_response['Errors']:
+                        errors_file.write('{0} failed because: {1}\n'.format(error['Key'], error['Message']))
+
+
+if __name__ == '__main__':
     # Parse arguments
     args = get_args()
 
@@ -295,87 +181,4 @@ def main():
         logger.info(arg_msg)
     logger.info('#'*len(start_msg))
 
-    key_count = key_file_len(args.filepath)
-
-    to_delete_queue = multiprocessing.JoinableQueue(maxsize=args.maxqueue)
-    deleted_queue = multiprocessing.JoinableQueue(maxsize=args.maxqueue)
-
-    # Our thread-safe variables, used for progress tracking
-    global queued_keys, deleted_keys
-    queued_keys = multiprocessing.Value('i', 0)
-    deleted_keys = multiprocessing.Value('i', 0)
-
-    # Start the progress_updater thread
-    progress_cancellation_token = threading.Event()
-    progress_updater_thread = threading.Thread(target=progress_updater,
-                                               name="progress_updater_thread",
-                                               args=(key_count, progress_cancellation_token))
-    progress_updater_thread.daemon = True
-    progress_updater_thread.start()
-
-    # Now start all of our delete threads
-    deleter_cancellation_token = threading.Event()
-    deleter_threads = []
-    for i in range(args.deleter_threads):
-        t = threading.Thread(target=deleter,
-                             name="deleter_thread_{0}".format(i),
-                             args=(args, to_delete_queue, deleted_queue, deleter_cancellation_token))
-        t.daemon = True
-        t.start()
-        deleter_threads.append(t)
-
-    # Start List thread
-    list_thread = threading.Thread(target=key_loader,
-                                   name="lister_thread",
-                                   args=(args.filepath, to_delete_queue, args.deleter_threads))
-    list_thread.daemon = True
-    list_thread.start()
-
-    # Start our output processed writer thread
-    processed_cancellation_token = threading.Event()
-    processed_writer_thread = threading.Thread(target=processed_writer,
-                                               name="processed_writer_thread",
-                                               args=('processed.txt', deleted_queue, processed_cancellation_token))
-    processed_writer_thread.daemon = True
-    processed_writer_thread.start()
-    time.sleep(5)
-
-    # wait for all records to be processed
-    try:
-        # Ensure all keys have been listed into the queue
-        list_thread.join()
-
-        # Wait for threads to finish
-        for thread in deleter_threads:
-            thread.join()
-
-        # Ensure we've finished writing all processed keys to our file
-        deleted_queue.join()
-
-        # Give the progress updater time to finish getting to 100%
-        time.sleep(1)
-
-        # Kill the progress updater thread
-        progress_cancellation_token.set()
-        progress_updater_thread.join()
-
-        # Kill the process worker thread
-        processed_cancellation_token.set()
-        processed_writer_thread.join()
-
-        time.sleep(5)
-
-        delete_msg = 'Finished deleting keys: {0}'.format(queued_keys.value)
-        logger.info(delete_msg)
-        print('\n'+delete_msg)
-
-    except KeyboardInterrupt:
-        print('\nCtrl-c pressed ...\n')
-        processed_cancellation_token.set()
-        deleter_cancellation_token.set()
-        progress_cancellation_token.set()
-
-
-if __name__ == '__main__':
-    main()
-    
+    do_delete(args.filepath, args.s3bucket, args.batchsize)
