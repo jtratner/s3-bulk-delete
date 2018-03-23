@@ -2,8 +2,8 @@
 Utility for bulk deleting objects from s3.
 
 There are 2 main scripts in this repo:
-- [s3bulkdelete.py](#s3bulkdelete.py-basic-usage) - (recommended) single threaded bulk delete
-- [s3threadeddelete.py](#advanced-usage - s3threadeddelete.py) - multithreaded threaded bulk delete
+- [s3bulkdelete.py](#advanced-usage---s3bulkdeletepy) - (recommended) single threaded bulk delete
+- [s3threadeddelete.py](#advanced-usage---s3threadeddeletepy) - multithreaded threaded bulk delete
 
 ## Installation
 
