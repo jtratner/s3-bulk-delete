@@ -17,7 +17,7 @@ There are 2 main scripts in this repo:
 
 The simplest use case is to supply an s3bucket and a filepath.  
 ```sh
- python .\s3bulkdelete.py --s3bucket docstorage-delete-test1 --filepath .\input.txt
+ python ./s3bulkdelete.py --s3bucket bucketxyz --filepath ./input.txt
 ```
 
 **Note:** The file should be a line-delimited set of keys that should be deleted from the s3bucket
@@ -25,7 +25,7 @@ The simplest use case is to supply an s3bucket and a filepath.
 ### Advanced Usage - s3bulkdelete.py
 
 ```text
- python .\s3bulkdelete.py -h
+ python ./s3bulkdelete.py -h
 usage: s3bulkdelete.py [-h] --filepath FILEPATH --s3bucket S3BUCKET [--dryrun]
                        [--loglevel [LOG_LEVEL]] [--batchsize BATCHSIZE]
 
@@ -48,7 +48,7 @@ optional arguments:
 Run the script with the --help option to view usage and available options:
 
 ```text
-python .\s3threadeddelete.py -h
+python ./s3threadeddelete.py -h
 usage: s3threadeddelete.py [-h] --filepath FILEPATH --s3bucket S3BUCKET
                            [--dryrun] [--loglevel [LOG_LEVEL]]
                            [--batchsize BATCHSIZE] [--maxqueue MAXQUEUE]
