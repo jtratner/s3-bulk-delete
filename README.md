@@ -1,17 +1,17 @@
 # s3-bulk-delete
-Utility for bulk deleting objects from s3
+Utility for bulk deleting objects from s3.
 
-## Install
+There are 2 main scripts in this repo:
+- [s3bulkdelete.py](#s3bulkdelete.py-basic-usage) - (recommended) single threaded bulk delete
+- [s3threadeddelete.py](#advanced-usage - s3threadeddelete.py) - multithreaded threaded bulk delete
 
-Install using pip directly from git
+## Installation
 
-``` sh
-# Install latest release
-$ pip3 install git+https://github.com/DiceHoldingsInc/s3-bulk-delete.git
+1. Clone from repo
+1. (Optional) `virtualenv venv && source ./venv/bin/activate`
+1. `pip install -r requirements.txt`
+1. `python ./s3bulkdelete.py`
 
-# Install specific version
-$ pip3 install git+https://github.com/DiceHoldingsInc/s3-bulk-delete.git@0.1.0
-```
 
 ## Basic Usage
 
@@ -22,16 +22,37 @@ The simplest use case is to supply an s3bucket and a filepath.
 
 **Note:** The file should be a line-delimited set of keys that should be deleted from the s3bucket
 
-### Advanced Usage
+### Advanced Usage - s3bulkdelete.py
+
+```text
+ python .\s3bulkdelete.py -h
+usage: s3bulkdelete.py [-h] --filepath FILEPATH --s3bucket S3BUCKET [--dryrun]
+                       [--loglevel [LOG_LEVEL]] [--batchsize BATCHSIZE]
+
+Delete a set of objects from an s3 bucket. Objects to be deleted are supplied
+in a line delimited file
+
+optional arguments:
+  -h, --help              show this help message and exit
+  --filepath FILEPATH     Path to text file containing line-delimited set of
+                          object keys to delete
+  --s3bucket S3BUCKET     S3 bucket name to delete from
+  --dryrun                Don't delete. Print what we would have deleted
+  --loglevel [LOG_LEVEL]  Set the logging output level. ['CRITICAL', 'ERROR',
+                          'WARNING', 'INFO', 'DEBUG']
+  --batchsize BATCHSIZE   # of keys to batch delete (default 1000)
+```
+
+### Advanced Usage - s3threadeddelete.py
 
 Run the script with the --help option to view usage and available options:
 
 ```text
-python .\s3bulkdelete.py -h
-usage: s3bulkdelete.py [-h] --filepath FILEPATH --s3bucket S3BUCKET [--dryrun]
-                       [--loglevel [LOG_LEVEL]] [--batchsize BATCHSIZE]
-                       [--maxqueue MAXQUEUE]
-                       [--deleterthreads DELETER_THREADS]
+python .\s3threadeddelete.py -h
+usage: s3threadeddelete.py [-h] --filepath FILEPATH --s3bucket S3BUCKET
+                           [--dryrun] [--loglevel [LOG_LEVEL]]
+                           [--batchsize BATCHSIZE] [--maxqueue MAXQUEUE]
+                           [--deleterthreads DELETER_THREADS]
 
 Delete a set of objects from an s3 bucket. Objects to be deleted are supplied
 in a line delimited file
