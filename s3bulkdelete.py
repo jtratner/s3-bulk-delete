@@ -14,7 +14,6 @@ _LOG_LEVEL_STRINGS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
 _s3client = boto3.client('s3')
 
 
-
 def _log_level_string_to_int(log_level_string):
     """Convert log-level arg to logging.level."""
     if not log_level_string in _LOG_LEVEL_STRINGS:
@@ -53,7 +52,7 @@ def get_args():
     parser.add_argument('--batchsize',
                         help='# of keys to batch delete (default 1000)',
                         type=int, default=1000)
-    
+
     return parser.parse_args()
 
 
@@ -74,8 +73,8 @@ def logger_setup(log_level):
     logger = logging.getLogger()
 
     # Make the logger emit all unhandled exceptions
-    sys.excepthook = lambda t, v, x: logger.error(
-        'Uncaught exception', exc_info=(t, v, x))
+    # sys.excepthook = lambda t, v, x: logger.error(
+    #     'Uncaught exception', exc_info=(t, v, x))
 
     # Supress boto debug logging, since it is very chatty
     logging.getLogger('boto3').setLevel(logging.WARNING)
@@ -84,10 +83,10 @@ def logger_setup(log_level):
 
 def key_file_len(filepath):
     """Quickly iterates the input file to get a count of keys to be processed.
-    
+
     Arguments:
         filepath {str} -- path to the file to count
-    
+
     Returns:
         {int} -- number of lines in file
     """
@@ -98,35 +97,15 @@ def key_file_len(filepath):
             pass
     return i + 1
 
-# from itertools-recipes
-def grouper(iterable, chunksize, fillvalue=None):
-    """Collect data into fixed-length chunks or blocks
-    
-    Arguments:
-        iterable -- iterable to operate on
-        chunksize {int} -- size of groups to chunk into
-    
-    Keyword Arguments:
-        fillvalue -- value to pad the last group with to reach 'chunksize' (default: {None})
-    
-    Returns:
-        iterable of grouped values
-
-    Example:
-        grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx
-    """
-    args = [iter(iterable)] * n
-    return itertools.zip_longest(*args, fillvalue=fillvalue)
-
 
 def do_delete(input_filepath, s3bucket_name, batch_size=1000):
     """
     delete all objects with keys in input_filepath from 's3bucket_name' 
-    
+
     Arguments:
         input_filepath {str} -- filepath to the file containing line-delimited set of keys
         s3bucket_name {str} -- name of s3 bucket to delete objects out of
-    
+
     Keyword Arguments:
         batch_size {int} -- batch size of delete requests against s3 (default: {1000})
     """
@@ -135,31 +114,57 @@ def do_delete(input_filepath, s3bucket_name, batch_size=1000):
     total_keys = key_file_len(input_filepath)
 
     with open(input_filepath, 'r') as object_key_file, open('deleted.txt', mode='w') as deleted_file, open('errored.txt', mode='w') as errors_file:
-        with tqdm.tqdm(total=total_keys,unit='keys',) as pbar:
-            for batch in grouper(object_key_file, batch_size):
-               
-                # start batch
-                delete_objects = []
-                for item in batch:
-                    if item is not None:
-                        delete_objects.append({'Key': item.rstrip()})
-
-                delete_response = _s3client.delete_objects(
+        with tqdm.tqdm(total=total_keys, unit='keys',) as pbar:
+            objects = []
+            
+            for key in object_key_file:
+                pbar.update(1)
+                
+                # list all versions for this object so we can delete all of them
+                object_versions_response = _s3client.list_object_versions(
                     Bucket=s3bucket_name,
-                    Delete={
-                        'Objects': delete_objects
-                    },
+                    Prefix=key.rstrip()
                 )
 
-                pbar.update(batch_size)
+                # batch up all versions into a single delete call
+                if 'Versions' not in object_versions_response:
+                    continue
+
+                versions = object_versions_response['Versions']
+                for v in versions:
+                    objects.append(
+                        {'VersionId': v['VersionId'], 'Key': v['Key']})
+                
+                if len(objects) >= 500:
+                    delete_response = _s3client.delete_objects(
+                        Bucket=s3bucket_name, Delete={'Objects': objects})
+
+                    if 'Deleted' in delete_response:
+                        for deleted in delete_response['Deleted']:
+                            deleted_file.write(deleted['Key']+'\n')
+
+                    if 'Errors' in delete_response:
+                        for error in delete_response['Errors']:
+                            errors_file.write('{0} failed because: {1}\n'.format(
+                                error['Key'], error['Message']))
+
+                    # reset batch list
+                    objects = []
+            
+            # run last batch
+            if len(objects):
+                delete_response = _s3client.delete_objects(
+                    Bucket=s3bucket_name, Delete={'Objects': objects})
 
                 if 'Deleted' in delete_response:
                     for deleted in delete_response['Deleted']:
                         deleted_file.write(deleted['Key']+'\n')
-                
+
                 if 'Errors' in delete_response:
                     for error in delete_response['Errors']:
-                        errors_file.write('{0} failed because: {1}\n'.format(error['Key'], error['Message']))
+                        errors_file.write('{0} failed because: {1}\n'.format(
+                            error['Key'], error['Message']))
+
 
 
 if __name__ == '__main__':
