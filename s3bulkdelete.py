@@ -8,10 +8,11 @@ import logging
 import boto3
 import tqdm
 import sys
+import asyncio
+import aiobotocore
 
 __version__ = '1.0.0'
 _LOG_LEVEL_STRINGS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
-_s3client = boto3.client('s3')
 
 
 def _log_level_string_to_int(log_level_string):
@@ -97,8 +98,43 @@ def key_file_len(filepath):
             pass
     return i + 1
 
+async def delete(sem, key, s3client, s3bucket_name):
+    async with sem:
+        status = {'deleted':[], 'errors': []}
 
-def do_delete(input_filepath, s3bucket_name, batch_size=1000):
+        # list all versions for this object so we can delete all of them
+        object_versions_response = await s3client.list_object_versions(
+            Bucket=s3bucket_name,
+            Prefix=key.rstrip()
+        )
+
+        # batch up all versions into a single delete call
+        if 'Versions' not in object_versions_response:
+            return status
+
+        versions = object_versions_response['Versions']
+        objects = []
+        for v in versions:
+            objects.append(
+                {'VersionId': v['VersionId'], 'Key': v['Key']})
+        
+        delete_response = await s3client.delete_objects(
+            Bucket=s3bucket_name, Delete={'Objects': objects})
+
+        
+        if 'Deleted' in delete_response:
+            for deleted in delete_response['Deleted']:
+                status['deleted'].append(deleted['Key'])
+
+        if 'Errors' in delete_response:
+            for error in delete_response['Errors']:
+                status['errors'].append('{0} failed because: {1}'.format(
+                    error['Key'], error['Message']))
+
+        return status
+
+
+async def do_delete(loop, input_filepath, s3bucket_name, batch_size=1000):
     """
     delete all objects with keys in input_filepath from 's3bucket_name' 
 
@@ -113,57 +149,19 @@ def do_delete(input_filepath, s3bucket_name, batch_size=1000):
     # quickly find the total keys we expect to delete to setup the progress bar
     total_keys = key_file_len(input_filepath)
 
-    with open(input_filepath, 'r') as object_key_file, open('deleted.txt', mode='w') as deleted_file, open('errored.txt', mode='w') as errors_file:
-        with tqdm.tqdm(total=total_keys, unit='keys',) as pbar:
-            objects = []
+    sem = asyncio.Semaphore(1000)
+    session = aiobotocore.get_session(loop=loop)
+    async with session.create_client('s3') as s3client:
+
+        with open(input_filepath, 'r') as object_key_file, open('deleted.txt', mode='w') as deleted_file, open('errored.txt', mode='w') as errors_file:
             
-            for key in object_key_file:
-                pbar.update(1)
-                
-                # list all versions for this object so we can delete all of them
-                object_versions_response = _s3client.list_object_versions(
-                    Bucket=s3bucket_name,
-                    Prefix=key.rstrip()
-                )
-
-                # batch up all versions into a single delete call
-                if 'Versions' not in object_versions_response:
-                    continue
-
-                versions = object_versions_response['Versions']
-                for v in versions:
-                    objects.append(
-                        {'VersionId': v['VersionId'], 'Key': v['Key']})
-                
-                if len(objects) >= 500:
-                    delete_response = _s3client.delete_objects(
-                        Bucket=s3bucket_name, Delete={'Objects': objects})
-
-                    if 'Deleted' in delete_response:
-                        for deleted in delete_response['Deleted']:
-                            deleted_file.write(deleted['Key']+'\n')
-
-                    if 'Errors' in delete_response:
-                        for error in delete_response['Errors']:
-                            errors_file.write('{0} failed because: {1}\n'.format(
-                                error['Key'], error['Message']))
-
-                    # reset batch list
-                    objects = []
-            
-            # run last batch
-            if len(objects):
-                delete_response = _s3client.delete_objects(
-                    Bucket=s3bucket_name, Delete={'Objects': objects})
-
-                if 'Deleted' in delete_response:
-                    for deleted in delete_response['Deleted']:
-                        deleted_file.write(deleted['Key']+'\n')
-
-                if 'Errors' in delete_response:
-                    for error in delete_response['Errors']:
-                        errors_file.write('{0} failed because: {1}\n'.format(
-                            error['Key'], error['Message']))
+            delete_tasks = [delete(sem, key, s3client, s3bucket_name) for key in object_key_file]
+            for status_task in tqdm.tqdm(asyncio.as_completed(delete_tasks), total=total_keys, unit='keys',):
+                status = await status_task
+                for item in status['deleted']:
+                    deleted_file.write("{0}\n".format(item))
+                for item in status['errors']:
+                    errors_file.write("{0}\n".format(item))
 
 
 
@@ -185,5 +183,6 @@ if __name__ == '__main__':
         print(arg_msg)
         logger.info(arg_msg)
     logger.info('#'*len(start_msg))
-
-    do_delete(args.filepath, args.s3bucket, args.batchsize)
+   
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete( do_delete(loop, args.filepath, args.s3bucket))
