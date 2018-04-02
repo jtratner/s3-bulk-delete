@@ -51,7 +51,10 @@ def get_args():
                         nargs='?',
                         help='Set the logging output level. {0}'.format(_LOG_LEVEL_STRINGS))
     parser.add_argument('--batchsize',
-                        help='# of keys to batch delete (default 1000)',
+                        help='# of keys to batch delete (default 500)',
+                        type=int, default=500)
+    parser.add_argument('--concurrency',
+                        help='# of concurrent actions (default 1000)',
                         type=int, default=1000)
 
     return parser.parse_args()
@@ -98,74 +101,148 @@ def key_file_len(filepath):
             pass
     return i + 1
 
-async def delete(sem, key, s3client, s3bucket_name):
+
+async def get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_filepath):
+    with tqdm.tqdm(total=total_keys, desc='Getting object versions', unit='keys',position=0) as progress:
+        for key in open(input_filepath, 'r'):
+            logger.debug("Discovering key '{}'".format(key.rstrip()))
+            
+            async with sem:
+                object_versions = []
+
+                # list all versions for this object so we can delete all of them
+                response = await s3client.list_object_versions(
+                    Bucket=s3bucket_name,
+                    Prefix=key.rstrip()
+                )
+
+                progress.update(1)
+                
+                # batch up all versions into a single delete call
+                versions = response['Versions'] if 'Versions' in response else []
+                for v in versions:
+                    object_versions.append(
+                        {'VersionId': v['VersionId'], 'Key': v['Key']})
+
+                delete_markers = response['DeleteMarkers'] if 'DeleteMarkers' in response else []
+                for dm in delete_markers:
+                    object_versions.append(
+                        {'VersionId': dm['VersionId'], 'Key': dm['Key']})
+
+                # put the item in the queue
+                await queue.put(object_versions)
+
+                # update the progressbar
+                logger.debug("Discovered key '{}'".format(key.rstrip()))
+
+        # indicate the producer is done
+        logger.debug('Done discovering key versions')
+        await queue.put(None)
+
+
+def _unique_items_by_keyname(list_of_dict, keyname):
+    return {i[keyname] for i in list_of_dict}
+
+
+async def delete(sem, queue, s3client, s3bucket_name, total_keys, batch_size):
+
+    with open('deleted.txt', mode='w') as deleted_file, \
+            open('errored.txt', mode='w') as errors_file, \
+            tqdm.tqdm(total=total_keys, desc='Deleting object versions', unit='keys',position=1) as progress:
+        object_versions = []
+
+        # We will break out of loop when we find 'None' on the queue
+        while True:
+            # wait for an item from the producer
+            item = await queue.get()
+            
+            # the producer emits None to indicate that it is done
+            if item is None:
+
+                # delete the last batch
+                if len(object_versions):
+                    # update progress bar with the number of keys processed.
+                    # Note: there might be multiple object versions for each key.
+                    # This is just a count of the unique keys
+                    keys_processed = _unique_items_by_keyname(
+                        object_versions, 'Key')
+
+                    logger.debug('Deleting batch of {} unique keys with {} versions'.format(len(keys_processed), len(object_versions)))
+
+                    # delete the set of object versions
+                    await delete_batch(sem, s3client, s3bucket_name,
+                                 object_versions, deleted_file, errors_file)
+
+                    logger.debug("Deleted keys: {}".format(keys_processed))
+                    
+                    progress.update(len(keys_processed))
+                break
+
+            object_versions += item
+
+            # if we have accumulated enough keys in this
+            # thread's delete list to justify a batch delete
+            if len(object_versions) >= batch_size:
+                # update progress bar with the number of keys processed.
+                # Note: there might be multiple object versions for each key.
+                # This is just a count of the unique keys
+                keys_processed = _unique_items_by_keyname(
+                    object_versions, 'Key')
+                
+                logger.debug('Deleting batch of {} unique keys with {} versions'.format(len(keys_processed), len(object_versions)))
+                
+                # delete the set of object versions
+                await delete_batch(sem, s3client, s3bucket_name,
+                             object_versions, deleted_file, errors_file)
+
+                logger.debug("Deleted keys: {}".format(keys_processed))
+ 
+                progress.update(len(keys_processed))
+
+                # reset the key list
+                object_versions = []
+
+
+async def delete_batch(sem, s3client, s3bucket_name, object_versions, deleted_file, errors_file):
     async with sem:
-        status = {'deleted':[], 'errors': []}
+        status = {'deleted': [], 'errors': []}
 
-        # list all versions for this object so we can delete all of them
-        object_versions_response = await s3client.list_object_versions(
-            Bucket=s3bucket_name,
-            Prefix=key.rstrip()
-        )
+        resp = await s3client.delete_objects(
+            Bucket=s3bucket_name, Delete={'Objects': object_versions})
 
-        # batch up all versions into a single delete call
-        if 'Versions' not in object_versions_response:
-            return status
-
-        versions = object_versions_response['Versions']
-        objects = []
-        for v in versions:
-            objects.append(
-                {'VersionId': v['VersionId'], 'Key': v['Key']})
-        
-        delete_response = await s3client.delete_objects(
-            Bucket=s3bucket_name, Delete={'Objects': objects})
-
-        
-        if 'Deleted' in delete_response:
-            for deleted in delete_response['Deleted']:
+        if 'Deleted' in resp:
+            for deleted in resp['Deleted']:
                 status['deleted'].append(deleted['Key'])
 
-        if 'Errors' in delete_response:
-            for error in delete_response['Errors']:
+        if 'Errors' in resp:
+            for error in resp['Errors']:
                 status['errors'].append('{0} failed because: {1}'.format(
                     error['Key'], error['Message']))
 
-        return status
+        for item in status['deleted']:
+            deleted_file.write("{0}\n".format(item))
+        for item in status['errors']:
+            errors_file.write("{0}\n".format(item))
 
 
-async def do_delete(loop, input_filepath, s3bucket_name, batch_size=1000):
-    """
-    delete all objects with keys in input_filepath from 's3bucket_name' 
+async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency):
 
-    Arguments:
-        input_filepath {str} -- filepath to the file containing line-delimited set of keys
-        s3bucket_name {str} -- name of s3 bucket to delete objects out of
-
-    Keyword Arguments:
-        batch_size {int} -- batch size of delete requests against s3 (default: {1000})
-    """
+    # Setup asyncio objects
+    queue = asyncio.Queue(loop=loop)
+    sem = asyncio.Semaphore(concurrency)
+    session = aiobotocore.get_session(loop=loop)
 
     # quickly find the total keys we expect to delete to setup the progress bar
     total_keys = key_file_len(input_filepath)
 
-    sem = asyncio.Semaphore(1000)
-    session = aiobotocore.get_session(loop=loop)
     async with session.create_client('s3') as s3client:
-
-        with open(input_filepath, 'r') as object_key_file, open('deleted.txt', mode='w') as deleted_file, open('errored.txt', mode='w') as errors_file:
-            
-            delete_tasks = [delete(sem, key, s3client, s3bucket_name) for key in object_key_file]
-            for status_task in tqdm.tqdm(asyncio.as_completed(delete_tasks), total=total_keys, unit='keys',):
-                status = await status_task
-                for item in status['deleted']:
-                    deleted_file.write("{0}\n".format(item))
-                for item in status['errors']:
-                    errors_file.write("{0}\n".format(item))
+        await asyncio.gather(
+            get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_filepath), 
+            delete(sem, queue, s3client, s3bucket_name, total_keys, batch_size=batch_size)
+        )
 
 
-
-if __name__ == '__main__':
+def main():
     # Parse arguments
     args = get_args()
 
@@ -183,6 +260,12 @@ if __name__ == '__main__':
         print(arg_msg)
         logger.info(arg_msg)
     logger.info('#'*len(start_msg))
-   
+
     loop = asyncio.get_event_loop()
-    loop.run_until_complete( do_delete(loop, args.filepath, args.s3bucket))
+    loop.run_until_complete(
+        run(loop, args.filepath, args.s3bucket, args.batchsize, args.concurrency))
+    loop.close()
+
+
+if __name__ == '__main__':
+    main()
