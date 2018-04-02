@@ -13,7 +13,7 @@ import aiobotocore
 
 __version__ = '1.0.0'
 _LOG_LEVEL_STRINGS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
-
+_SENTINEL = None
 
 def _log_level_string_to_int(log_level_string):
     """Convert log-level arg to logging.level."""
@@ -103,6 +103,18 @@ def key_file_len(filepath):
 
 
 async def get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_filepath):
+    """
+    Loads all objects from the input file, queries s3 for all object versions
+    of each object and queues the object versions on the the queue for processing by the deleter.
+    
+    Arguments:
+        sem {semaphore} -- semaphore to control concurrency
+        queue {queue} -- queue for sharing work with the deleter
+        s3client {aiobotocore s3client} -- s3 client
+        s3bucket_name {str} -- bucket to delete from
+        total_keys {int} -- the total keys to delete.  note: this is used to initialize the progress bar
+        input_filepath {str} -- path of the file holding keys to delete
+    """
     with tqdm.tqdm(total=total_keys, desc='Getting object versions', unit='keys',position=0) as progress:
         for key in open(input_filepath, 'r'):
             logger.debug("Discovering key '{}'".format(key.rstrip()))
@@ -137,15 +149,36 @@ async def get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_fi
 
         # indicate the producer is done
         logger.debug('Done discovering key versions')
-        await queue.put(None)
+        # push sentinel value onto queue
+        await queue.put(_SENTINEL)
 
 
 def _unique_items_by_keyname(list_of_dict, keyname):
+    """
+    Convert a list of dictionaries to a set by extracting 
+    the values of 'keyname' from each item in the list.
+    
+    Arguments:
+        list_of_dict {list of dict} -- list of dictionaries to extract from
+        keyname {str} -- key to extract from each dictionary item in the list
+    """
     return {i[keyname] for i in list_of_dict}
 
 
-async def delete(sem, queue, s3client, s3bucket_name, total_keys, batch_size):
+async def delete_versions(sem, queue, s3client, s3bucket_name, total_keys, batch_size):
+    """
+    Deleter process that groups up batches of object versions for deletion.
+    It loops until it recieves the sentinel value from the queue.
 
+    Arguments:
+        sem {[semaphore]} -- semaphore to control concurrency
+        queue {queue} -- queue for sharing work with the deleter
+        s3client {aiobotocore s3client} -- s3 client
+        s3bucket_name {str} -- bucket to delete from
+        total_keys {int} -- the total keys to delete.  note: this is used to initialize the progress bar
+        batch_size {int} -- the desired number of object versions to batch together into a single delete_objects
+            request
+    """
     with open('deleted.txt', mode='w') as deleted_file, \
             open('errored.txt', mode='w') as errors_file, \
             tqdm.tqdm(total=total_keys, desc='Deleting object versions', unit='keys',position=1) as progress:
@@ -156,8 +189,8 @@ async def delete(sem, queue, s3client, s3bucket_name, total_keys, batch_size):
             # wait for an item from the producer
             item = await queue.get()
             
-            # the producer emits None to indicate that it is done
-            if item is None:
+            # the producer emits a sentinel value to indicate that it is done
+            if item is _SENTINEL:
 
                 # delete the last batch
                 if len(object_versions):
@@ -204,6 +237,16 @@ async def delete(sem, queue, s3client, s3bucket_name, total_keys, batch_size):
 
 
 async def delete_batch(sem, s3client, s3bucket_name, object_versions, deleted_file, errors_file):
+    """Delete a batch of records from s3
+    
+    Arguments:
+        sem {[semaphore]} -- semaphore to control concurrency
+        s3client {aiobotocore s3client} -- s3 client
+        s3bucket_name {str} -- bucket to delete from
+        object_versions {list of dict} -- list of object versions to delete
+        deleted_file {file} -- file object for the file to record deleted keys
+        errors_file {file} -- file object for the file to record errors
+    """
     async with sem:
         status = {'deleted': [], 'errors': []}
 
@@ -226,7 +269,19 @@ async def delete_batch(sem, s3client, s3bucket_name, object_versions, deleted_fi
 
 
 async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency):
+    """
+    Top level async task loop that coordinates with the get_versions (producer)
+    and delete_versions (consumer) coroutines.
 
+
+    Arguments:
+        loop {asyncio.AbstractEventLoop} -- asyncio event loop
+        input_filepath {str} -- path of the file holding keys to delete
+        s3bucket_name {str} -- bucket to delete from
+        batch_size {int} -- the desired number of object versions to batch together into a single delete_objects
+            request
+        concurrency {int} -- max number of concurrent asyncio actions
+    """
     # Setup asyncio objects
     queue = asyncio.Queue(loop=loop)
     sem = asyncio.Semaphore(concurrency)
@@ -236,9 +291,12 @@ async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency):
     total_keys = key_file_len(input_filepath)
 
     async with session.create_client('s3') as s3client:
+        # wait until we have completed:
+        # - the extraction of all object versions
+        # - the deletions of all those object versions
         await asyncio.gather(
             get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_filepath), 
-            delete(sem, queue, s3client, s3bucket_name, total_keys, batch_size=batch_size)
+            delete_versions(sem, queue, s3client, s3bucket_name, total_keys, batch_size=batch_size)
         )
 
 
@@ -261,7 +319,10 @@ def main():
         logger.info(arg_msg)
     logger.info('#'*len(start_msg))
 
+    # Run asyncronous event loop
     loop = asyncio.get_event_loop()
+
+    # Runs the event loop until the 'run' method completes
     loop.run_until_complete(
         run(loop, args.filepath, args.s3bucket, args.batchsize, args.concurrency))
     loop.close()
