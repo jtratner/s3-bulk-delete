@@ -44,6 +44,11 @@ def get_args():
     parser.add_argument('--dryrun',
                         help="Don't delete.  Print what we would have deleted",
                         action='store_true')
+    parser.add_argument('--only-delete-latest',
+                        help="Only delete latest version (e.g., so lifecycle policies can delete remaining",
+                        action='store_false',
+                        dest='delete_all_versions',
+                        default=True)
     parser.add_argument('--loglevel',
                         default='INFO',
                         dest='log_level',
@@ -100,6 +105,12 @@ def key_file_len(filepath):
         for i, _ in enumerate(key_file):
             pass
     return i + 1
+
+async def pass_through_keys(sem, queue, s3client, s3bucket_name, total_keys, input_filepath):
+    """Fake out doing object versions by just putting keys directly through"""
+    for key in open(input_filepath, 'r'):
+        async with sem:
+            await queue.put({"Key": key.rstrip()})
 
 
 async def get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_filepath):
@@ -268,7 +279,7 @@ async def delete_batch(sem, s3client, s3bucket_name, object_versions, deleted_fi
             errors_file.write("{0}\n".format(item))
 
 
-async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency):
+async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency, delete_all_versions):
     """
     Top level async task loop that coordinates with the get_versions (producer)
     and delete_versions (consumer) coroutines.
@@ -281,6 +292,7 @@ async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency):
         batch_size {int} -- the desired number of object versions to batch together into a single delete_objects
             request
         concurrency {int} -- max number of concurrent asyncio actions
+        delete_all_versions {bool} -- if True, delete all object versions; otherwise only delete latest
     """
     # Setup asyncio objects
     queue = asyncio.Queue(loop=loop)
@@ -291,11 +303,15 @@ async def run(loop, input_filepath, s3bucket_name, batch_size, concurrency):
     total_keys = key_file_len(input_filepath)
 
     async with session.create_client('s3') as s3client:
+        if delete_all_versions:
+            extracter = get_versions
+        else:
+            extracter = pass_through_keys
         # wait until we have completed:
         # - the extraction of all object versions
         # - the deletions of all those object versions
         await asyncio.gather(
-            get_versions(sem, queue, s3client, s3bucket_name, total_keys, input_filepath), 
+            extracter(sem, queue, s3client, s3bucket_name, total_keys, input_filepath), 
             delete_versions(sem, queue, s3client, s3bucket_name, total_keys, batch_size=batch_size)
         )
 
@@ -324,7 +340,7 @@ def main():
 
     # Runs the event loop until the 'run' method completes
     loop.run_until_complete(
-        run(loop, args.filepath, args.s3bucket, args.batchsize, args.concurrency))
+        run(loop, args.filepath, args.s3bucket, args.batchsize, args.concurrency, args.delete_all_versions))
     loop.close()
 
 
